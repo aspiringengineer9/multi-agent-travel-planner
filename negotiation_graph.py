@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Multi-Agent Itinerary Planning System — LangGraph rewrite (Phase 1b)
-Config-driven: actors, scenario, topics, and rounds loaded from YAML.
+Multi-Agent Itinerary Planning System — LangGraph rewrite (Phase 1c)
+Config-driven + per-actor memory: agents track private proposals across rounds;
+adjudicator tracks position deltas; shared memory surfaces agreed items to all.
 """
 
 import os
+import json
 import functools
 from datetime import datetime
 from typing import Annotated
@@ -220,6 +222,22 @@ def _log_session_footer(started_at: datetime, final_status: str, total_messages:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Memory helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def memory_read(memory: dict) -> str:
+    """Format a memory dict as a readable bullet list for prompt injection."""
+    if not memory:
+        return "(none)"
+    return "\n".join(f"  - {k}: {v}" for k, v in memory.items())
+
+
+def memory_write(memory: dict, key: str, value: str) -> dict:
+    """Return a new memory dict with the entry added (immutable update)."""
+    return {**memory, key: value}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -303,39 +321,84 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
             "If this is the final round, begin wrapping up toward a resolution."
         )
 
-    msgs = build_prompt_messages(actor["system_prompt"], state, adj_prompt)
+    adj_mem = state["adjudicator_memory"]
+    shared = state["shared_memory"]
+
+    memory_context = ""
+    if adj_mem:
+        memory_context += f"\nYour position tracking from previous rounds:\n{memory_read(adj_mem)}"
+    if shared:
+        memory_context += f"\nCurrently agreed items:\n{memory_read(shared)}"
+
+    adj_prompt_full = adj_prompt + (f"\n\n{memory_context}" if memory_context else "")
+
+    msgs = build_prompt_messages(actor["system_prompt"], state, adj_prompt_full)
     msgs = inject_think_prefix(msgs)
     response = _llms["adjudicator"].invoke(msgs)
 
     _display_and_log(f"{actor['display_name']} (Round {round_num + 1})", response.content)
     labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
-    return {"messages": [labeled], "round": round_num + 1}
+
+    synthesis_key = f"round_{round_num + 1}_synthesis"
+    updated_adj_memory = memory_write(adj_mem, synthesis_key, response.content[:300])
+    updated_shared = memory_write(shared, synthesis_key, response.content[:300])
+
+    return {
+        "messages": [labeled],
+        "round": round_num + 1,
+        "adjudicator_memory": updated_adj_memory,
+        "shared_memory": updated_shared,
+    }
 
 
 def agent_a_node(state: NegotiationState) -> dict:
     actor = state["scenario"]["actors"]["agent_a"]
-    msgs = build_prompt_messages(
-        actor["system_prompt"], state,
+    round_num = state["round"]
+    my_memory = state["agent_a_memory"]
+    shared = state["shared_memory"]
+
+    memory_context = ""
+    if my_memory:
+        memory_context += f"\nYour notes from previous rounds:\n{memory_read(my_memory)}"
+    if shared:
+        memory_context += f"\nCurrently agreed (from adjudicator):\n{memory_read(shared)}"
+
+    user_content = (
         "Respond to the Adjudicator's latest framing. Present your position "
         "or counter-proposal on behalf of your human."
+        + (f"\n\n{memory_context}" if memory_context else "")
     )
+    msgs = build_prompt_messages(actor["system_prompt"], state, user_content)
     response = _llms["agent_a"].invoke(msgs)
     _display_and_log(actor["display_name"], response.content)
     labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
-    return {"messages": [labeled]}
+    updated_memory = memory_write(my_memory, f"round_{round_num}_proposal", response.content[:300])
+    return {"messages": [labeled], "agent_a_memory": updated_memory}
 
 
 def agent_b_node(state: NegotiationState) -> dict:
     actor = state["scenario"]["actors"]["agent_b"]
-    msgs = build_prompt_messages(
-        actor["system_prompt"], state,
+    round_num = state["round"]
+    my_memory = state["agent_b_memory"]
+    shared = state["shared_memory"]
+
+    memory_context = ""
+    if my_memory:
+        memory_context += f"\nYour notes from previous rounds:\n{memory_read(my_memory)}"
+    if shared:
+        memory_context += f"\nCurrently agreed (from adjudicator):\n{memory_read(shared)}"
+
+    user_content = (
         "Respond to the Adjudicator's latest framing. Present your position "
         "or counter-proposal on behalf of your human."
+        + (f"\n\n{memory_context}" if memory_context else "")
     )
+    msgs = build_prompt_messages(actor["system_prompt"], state, user_content)
     response = _llms["agent_b"].invoke(msgs)
     _display_and_log(actor["display_name"], response.content)
     labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
-    return {"messages": [labeled]}
+    updated_memory = memory_write(my_memory, f"round_{round_num}_proposal", response.content[:300])
+    return {"messages": [labeled], "agent_b_memory": updated_memory}
 
 
 def resolution_node(state: NegotiationState) -> dict:
@@ -344,13 +407,23 @@ def resolution_node(state: NegotiationState) -> dict:
     _print_and_log("─" * 72)
 
     actor = state["scenario"]["actors"]["adjudicator"]
-    msgs = build_prompt_messages(
-        actor["system_prompt"], state,
+    adj_mem = state["adjudicator_memory"]
+    shared = state["shared_memory"]
+
+    memory_context = ""
+    if adj_mem:
+        memory_context += f"\nYour position tracking across all rounds:\n{memory_read(adj_mem)}"
+    if shared:
+        memory_context += f"\nCurrently agreed items:\n{memory_read(shared)}"
+
+    resolution_prompt = (
         "All negotiation rounds are complete. Declare the final outcome:\n"
         "- State whether consensus was reached, partial agreement, or impasse.\n"
         "- Provide a structured summary of what was agreed for each topic.\n"
         "- Note any unresolved disagreements."
+        + (f"\n\n{memory_context}" if memory_context else "")
     )
+    msgs = build_prompt_messages(actor["system_prompt"], state, resolution_prompt)
     msgs = inject_think_prefix(msgs)
     response = _llms["adjudicator"].invoke(msgs)
 
@@ -455,6 +528,17 @@ def run_session(config_path: str) -> dict:
         final_state.get("status", "unknown"),
         len(final_state.get("messages", [])),
     )
+
+    if ENABLE_LOGGING:
+        memory_path = log_path.replace(".log", "_memory.json")
+        with open(memory_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "shared_memory": final_state.get("shared_memory", {}),
+                "agent_a_memory": final_state.get("agent_a_memory", {}),
+                "agent_b_memory": final_state.get("agent_b_memory", {}),
+                "adjudicator_memory": final_state.get("adjudicator_memory", {}),
+            }, f, indent=2)
+        print(f"[LOG] Memory snapshot written to: {memory_path}")
 
     if _log_file:
         _log_file.close()
