@@ -86,14 +86,18 @@ def _human_prompt(actor: dict) -> str:
 
 def _agent_prompt(human: dict) -> str:
     budget_line = (
-        f"${human['budget']}/day strict budget"
+        f"${human['budget']}/day strict budget — do not exceed this"
         if human.get("budget")
-        else "flexible budget"
+        else "flexible budget — comfort and quality matter more than cost"
     )
+    personality = human.get("personality", "")
     return (
         f"You are the advocate for {human['name']} ({budget_line}).\n"
-        "Your job is to negotiate on behalf of your human with the Adjudicator.\n"
-        "Propose options that align with your human's preferences and find workable compromises.\n"
+        f"Your human's profile: {personality}.\n"
+        "Your job is to negotiate on behalf of your human with the Adjudicator. "
+        "Argue firmly for options that fit your human's profile and budget. "
+        "Push back on proposals that don't work for your human. "
+        "Only concede on points that are genuinely acceptable given your human's constraints.\n"
         "Always address the Adjudicator directly — never speak to the other agent.\n"
         "Keep your responses to 2-3 paragraphs max."
     )
