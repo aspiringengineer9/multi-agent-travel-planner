@@ -149,6 +149,76 @@ def _print_and_log(text: str):
         _log_file.flush()
 
 
+def _log_session_header(config_path: str, scenario: dict, started_at: datetime):
+    """Write a structured preamble to the log file before the conversation begins."""
+    if not _log_file:
+        return
+
+    actors = scenario["actors"]
+    topics = ", ".join(scenario.get("topics", []))
+
+    lines = [
+        "╔" + "═" * 70 + "╗",
+        "║" + " SESSION METADATA ".center(70) + "║",
+        "╚" + "═" * 70 + "╝",
+        f"  Started   : {started_at.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  Config    : {os.path.abspath(config_path)}",
+        f"  Model     : {MODEL}",
+        f"  Max rounds: {scenario.get('max_rounds', 3)}",
+        f"  Topics    : {topics}",
+        "",
+        "  ACTORS",
+        "  " + "─" * 40,
+    ]
+
+    for key, actor in actors.items():
+        lines.append(f"  [{key}]  {actor.get('display_name', key)}  (role: {actor['role']})")
+        if actor.get("personality"):
+            lines.append(f"    personality : {actor['personality']}")
+        if actor.get("budget") is not None:
+            lines.append(f"    budget      : ${actor['budget']}/day")
+        lines.append(f"    system prompt:")
+        for prompt_line in actor["system_prompt"].splitlines():
+            lines.append(f"      {prompt_line}")
+        lines.append("")
+
+    lines += [
+        "═" * 72,
+        "  CONVERSATION TRANSCRIPT",
+        "═" * 72,
+        "",
+    ]
+
+    _log_file.write("\n".join(lines) + "\n")
+    _log_file.flush()
+
+
+def _log_session_footer(started_at: datetime, final_status: str, total_messages: int):
+    """Write a summary footer to the log file after the conversation ends."""
+    if not _log_file:
+        return
+
+    ended_at = datetime.now()
+    duration = ended_at - started_at
+    minutes, seconds = divmod(int(duration.total_seconds()), 60)
+
+    lines = [
+        "",
+        "═" * 72,
+        "  SESSION SUMMARY",
+        "═" * 72,
+        f"  Started : {started_at.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  Ended   : {ended_at.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  Duration: {minutes}m {seconds}s",
+        f"  Status  : {final_status}",
+        f"  Turns   : {total_messages}",
+        "═" * 72,
+    ]
+
+    _log_file.write("\n".join(lines) + "\n")
+    _log_file.flush()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,13 +416,16 @@ def run_session(config_path: str) -> dict:
         for key in scenario["actors"]
     }
 
+    started_at = datetime.now()
+
     if ENABLE_LOGGING:
         output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
         os.makedirs(output_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = started_at.strftime("%Y-%m-%d_%H%M%S")
         log_path = os.path.join(output_dir, f"session_{timestamp}.log")
         _log_file = open(log_path, "w", encoding="utf-8")
         print(f"[LOG] Writing session log to: {log_path}\n")
+        _log_session_header(config_path, scenario, started_at)
 
     header = (
         "\n" + "╔" + "═" * 70 + "╗\n"
@@ -376,6 +449,12 @@ def run_session(config_path: str) -> dict:
 
     graph = build_graph()
     final_state = graph.invoke(initial_state)
+
+    _log_session_footer(
+        started_at,
+        final_state.get("status", "unknown"),
+        len(final_state.get("messages", [])),
+    )
 
     if _log_file:
         _log_file.close()
