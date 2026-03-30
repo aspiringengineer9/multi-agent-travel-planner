@@ -1,69 +1,29 @@
 #!/usr/bin/env python3
 """
-Multi-Agent Itinerary Planning System — LangGraph rewrite (Phase 1a)
-Same behavior as multi_agent.py, restructured as a LangGraph state machine.
+Multi-Agent Itinerary Planning System — LangGraph rewrite (Phase 1b)
+Config-driven: actors, scenario, topics, and rounds loaded from YAML.
 """
 
 import os
-import sys
 import functools
 from datetime import datetime
 from typing import Annotated
 from typing_extensions import TypedDict
 
+import yaml
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# Force unbuffered output
 print = functools.partial(print, flush=True)
 
 MODEL = "qwen3:8b"
 ENABLE_LOGGING = True
 SEPARATOR = "═" * 72
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# System Prompts  (unchanged from multi_agent.py)
-# ─────────────────────────────────────────────────────────────────────────────
-
-HUMAN_A_PROMPT = """\
-You are Human A — the "Budget Backpacker." You are a 25-year-old grad student.
-Your priorities: hostels, street food, free walking tours, outdoor activities.
-You have a strict $50/day budget. You willingly sacrifice comfort for authentic local experiences.
-State your preferences and constraints clearly and naturally.
-Keep your responses to 2-3 paragraphs max.\
-"""
-
-HUMAN_B_PROMPT = """\
-You are Human B — the "Luxury Seeker." You are a 45-year-old executive.
-Your priorities: boutique hotels, fine dining, cultural landmarks, spa experiences.
-Your budget is flexible but you value time efficiency. You prefer guided private tours over crowds.
-State your preferences and constraints clearly and naturally.
-Keep your responses to 2-3 paragraphs max.\
-"""
-
-AGENT_A_PROMPT = """\
-You are Agent A — the advocate for Human A (the Budget Backpacker, $50/day strict budget).
-Your job is to negotiate on behalf of Human A with the Adjudicator.
-Propose budget-friendly options and find compromises that don't break the bank.
-Tone: enthusiastic, resourceful, occasionally push back on expensive suggestions.
-Always address the Adjudicator directly — never speak to Agent B.
-Keep your responses to 2-3 paragraphs max.\
-"""
-
-AGENT_B_PROMPT = """\
-You are Agent B — the advocate for Human B (the Luxury Seeker, flexible budget, values quality).
-Your job is to negotiate on behalf of Human B with the Adjudicator.
-Propose quality-focused options and find compromises that maintain comfort standards.
-Tone: professional, persuasive, occasionally concede on non-essentials.
-Always address the Adjudicator directly — never speak to Agent A.
-Keep your responses to 2-3 paragraphs max.\
-"""
-
 ADJUDICATOR_PROMPT = """\
-You are the Adjudicator — a neutral moderator mediating between Agent A (Budget Backpacker advocate) and Agent B (Luxury Seeker advocate).
+You are the Adjudicator — a neutral moderator mediating between the agents representing each traveler.
 Your responsibilities:
 - Summarize the current state of agreement and disagreement.
 - Identify potential compromises neither agent has considered.
@@ -80,30 +40,95 @@ Keep your responses to 2-3 paragraphs max.\
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NegotiationState(TypedDict):
-    messages: Annotated[list, add_messages]  # shared conversation history
-    shared_memory: dict       # placeholder — populated in Phase 1c
+    messages: Annotated[list, add_messages]
+    shared_memory: dict
     agent_a_memory: dict
     agent_b_memory: dict
     adjudicator_memory: dict
-    round: int                # incremented by adjudicator_loop_node
+    round: int
     max_rounds: int
     status: str               # "negotiating" | "consensus" | "impasse"
-    scenario: dict            # {"description": "..."}
+    scenario: dict            # full enriched config (actors, topics, description, ...)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM instances  (one per actor — temperatures differ, must not be shared)
+# LLM registry  (populated in run_session before graph invocation)
 # ─────────────────────────────────────────────────────────────────────────────
 
-llm_human_a     = ChatOllama(model=MODEL, temperature=0.7)
-llm_human_b     = ChatOllama(model=MODEL, temperature=0.7)
-llm_agent_a     = ChatOllama(model=MODEL, temperature=0.7)
-llm_agent_b     = ChatOllama(model=MODEL, temperature=0.7)
-llm_adjudicator = ChatOllama(model=MODEL, temperature=0.4)
+_llms: dict = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging  (module-level handle; nodes are stateless functions)
+# Config loading and prompt generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_config(config_path: str) -> dict:
+    with open(config_path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _human_prompt(actor: dict) -> str:
+    budget_line = (
+        f"You have a strict ${actor['budget']}/day budget."
+        if actor.get("budget")
+        else "Your budget is flexible."
+    )
+    return (
+        f"You are {actor['name']}.\n"
+        f"{actor['personality']}.\n"
+        f"{budget_line} "
+        "State your preferences and constraints clearly and naturally. "
+        "Keep your responses to 2-3 paragraphs max."
+    )
+
+
+def _agent_prompt(human: dict) -> str:
+    budget_line = (
+        f"${human['budget']}/day strict budget"
+        if human.get("budget")
+        else "flexible budget"
+    )
+    return (
+        f"You are the advocate for {human['name']} ({budget_line}).\n"
+        "Your job is to negotiate on behalf of your human with the Adjudicator.\n"
+        "Propose options that align with your human's preferences and find workable compromises.\n"
+        "Always address the Adjudicator directly — never speak to the other agent.\n"
+        "Keep your responses to 2-3 paragraphs max."
+    )
+
+
+def build_scenario(config: dict) -> dict:
+    """Enrich raw config with generated system_prompt and display_name for every actor."""
+    actors = config["actors"]
+    humans = {k: v for k, v in actors.items() if v["role"] == "human"}
+
+    enriched: dict = {}
+    for i, (key, human) in enumerate(humans.items(), start=1):
+        letter = chr(ord("a") + i - 1)
+        agent_key = f"agent_{letter}"
+
+        enriched[key] = {
+            **human,
+            "system_prompt": _human_prompt(human),
+            "display_name": f"Human {letter.upper()} ({human['name']})",
+        }
+        enriched[agent_key] = {
+            "role": "agent",
+            "system_prompt": _agent_prompt(human),
+            "display_name": f"Agent {letter.upper()} ({human['name']} Advocate)",
+        }
+
+    enriched["adjudicator"] = {
+        "role": "adjudicator",
+        "system_prompt": ADJUDICATOR_PROMPT,
+        "display_name": "Adjudicator",
+    }
+
+    return {**config, "actors": enriched}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
 _log_file = None
@@ -130,7 +155,6 @@ def _print_and_log(text: str):
 
 def build_prompt_messages(system_prompt: str, state: NegotiationState,
                           extra_user_content: str) -> list:
-    """Construct the message list for a single actor invocation."""
     return (
         [SystemMessage(content=system_prompt)]
         + list(state["messages"])
@@ -139,7 +163,6 @@ def build_prompt_messages(system_prompt: str, state: NegotiationState,
 
 
 def inject_think_prefix(messages: list) -> list:
-    """Prepend '/think ' to the last HumanMessage for qwen3 thinking mode."""
     result = list(messages)
     for i in reversed(range(len(result))):
         if isinstance(result[i], HumanMessage):
@@ -157,38 +180,36 @@ def human_a_node(state: NegotiationState) -> dict:
     _print_and_log("  PHASE 1: PREFERENCE GATHERING")
     _print_and_log("─" * 72)
 
-    scenario_text = state["scenario"]["description"]
+    actor = state["scenario"]["actors"]["human_a"]
     msgs = build_prompt_messages(
-        HUMAN_A_PROMPT, state,
-        f"A trip is being planned. Here is the scenario: {scenario_text}\n"
+        actor["system_prompt"], state,
+        f"A trip is being planned. Here is the scenario: {state['scenario']['description']}\n"
         "Please state your preferences and constraints as a traveler."
     )
-    response = llm_human_a.invoke(msgs)
-    _display_and_log("Human A (Budget Backpacker)", response.content)
-    labeled = HumanMessage(
-        content=f"[Human A (Budget Backpacker)]: {response.content}"
-    )
+    response = _llms["human_a"].invoke(msgs)
+    _display_and_log(actor["display_name"], response.content)
+    labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
     return {"messages": [labeled]}
 
 
 def human_b_node(state: NegotiationState) -> dict:
-    scenario_text = state["scenario"]["description"]
+    actor = state["scenario"]["actors"]["human_b"]
     msgs = build_prompt_messages(
-        HUMAN_B_PROMPT, state,
-        f"A trip is being planned. Here is the scenario: {scenario_text}\n"
+        actor["system_prompt"], state,
+        f"A trip is being planned. Here is the scenario: {state['scenario']['description']}\n"
         "Please state your preferences and constraints as a traveler."
     )
-    response = llm_human_b.invoke(msgs)
-    _display_and_log("Human B (Luxury Seeker)", response.content)
-    labeled = HumanMessage(
-        content=f"[Human B (Luxury Seeker)]: {response.content}"
-    )
+    response = _llms["human_b"].invoke(msgs)
+    _display_and_log(actor["display_name"], response.content)
+    labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
     return {"messages": [labeled]}
 
 
 def adjudicator_loop_node(state: NegotiationState) -> dict:
     round_num = state["round"]
     max_rounds = state["max_rounds"]
+    actor = state["scenario"]["actors"]["adjudicator"]
+    topics = ", ".join(state["scenario"].get("topics", []))
 
     if round_num == 0:
         _print_and_log("\n" + "─" * 72)
@@ -200,8 +221,9 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
     if round_num == 0:
         adj_prompt = (
             "You have heard both travelers' preferences. "
+            f"Topics to negotiate: {topics}. "
             "Frame the first key trade-off or question for the agents to discuss. "
-            "Focus on one topic at a time (e.g., accommodation first)."
+            "Focus on one topic at a time."
         )
     else:
         adj_prompt = (
@@ -211,40 +233,38 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
             "If this is the final round, begin wrapping up toward a resolution."
         )
 
-    msgs = build_prompt_messages(ADJUDICATOR_PROMPT, state, adj_prompt)
+    msgs = build_prompt_messages(actor["system_prompt"], state, adj_prompt)
     msgs = inject_think_prefix(msgs)
-    response = llm_adjudicator.invoke(msgs)
+    response = _llms["adjudicator"].invoke(msgs)
 
-    _display_and_log(f"Adjudicator (Round {round_num + 1})", response.content)
-    labeled = HumanMessage(content=f"[Adjudicator]: {response.content}")
+    _display_and_log(f"{actor['display_name']} (Round {round_num + 1})", response.content)
+    labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
     return {"messages": [labeled], "round": round_num + 1}
 
 
 def agent_a_node(state: NegotiationState) -> dict:
+    actor = state["scenario"]["actors"]["agent_a"]
     msgs = build_prompt_messages(
-        AGENT_A_PROMPT, state,
+        actor["system_prompt"], state,
         "Respond to the Adjudicator's latest framing. Present your position "
-        "or counter-proposal on behalf of Human A (Budget Backpacker)."
+        "or counter-proposal on behalf of your human."
     )
-    response = llm_agent_a.invoke(msgs)
-    _display_and_log("Agent A (Budget Advocate)", response.content)
-    labeled = HumanMessage(
-        content=f"[Agent A (Budget Advocate)]: {response.content}"
-    )
+    response = _llms["agent_a"].invoke(msgs)
+    _display_and_log(actor["display_name"], response.content)
+    labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
     return {"messages": [labeled]}
 
 
 def agent_b_node(state: NegotiationState) -> dict:
+    actor = state["scenario"]["actors"]["agent_b"]
     msgs = build_prompt_messages(
-        AGENT_B_PROMPT, state,
+        actor["system_prompt"], state,
         "Respond to the Adjudicator's latest framing. Present your position "
-        "or counter-proposal on behalf of Human B (Luxury Seeker)."
+        "or counter-proposal on behalf of your human."
     )
-    response = llm_agent_b.invoke(msgs)
-    _display_and_log("Agent B (Luxury Advocate)", response.content)
-    labeled = HumanMessage(
-        content=f"[Agent B (Luxury Advocate)]: {response.content}"
-    )
+    response = _llms["agent_b"].invoke(msgs)
+    _display_and_log(actor["display_name"], response.content)
+    labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
     return {"messages": [labeled]}
 
 
@@ -253,20 +273,20 @@ def resolution_node(state: NegotiationState) -> dict:
     _print_and_log("  PHASE 3: RESOLUTION")
     _print_and_log("─" * 72)
 
+    actor = state["scenario"]["actors"]["adjudicator"]
     msgs = build_prompt_messages(
-        ADJUDICATOR_PROMPT, state,
+        actor["system_prompt"], state,
         "All negotiation rounds are complete. Declare the final outcome:\n"
         "- State whether consensus was reached, partial agreement, or impasse.\n"
-        "- Provide a structured summary of what was agreed for each topic "
-        "(accommodation, daily activities, dinners).\n"
+        "- Provide a structured summary of what was agreed for each topic.\n"
         "- Note any unresolved disagreements."
     )
     msgs = inject_think_prefix(msgs)
-    response = llm_adjudicator.invoke(msgs)
+    response = _llms["adjudicator"].invoke(msgs)
 
-    _display_and_log("Adjudicator (Final Resolution)", response.content)
+    _display_and_log(f"{actor['display_name']} (Final Resolution)", response.content)
     labeled = HumanMessage(
-        content=f"[Adjudicator (Final Resolution)]: {response.content}"
+        content=f"[{actor['display_name']} (Final Resolution)]: {response.content}"
     )
     return {"messages": [labeled], "status": "consensus"}
 
@@ -296,7 +316,6 @@ def build_graph() -> StateGraph:
     builder.add_node("resolution", resolution_node)
 
     builder.set_entry_point("human_a")
-
     builder.add_edge("human_a", "human_b")
     builder.add_edge("human_b", "adjudicator_loop")
     builder.add_conditional_edges(
@@ -315,8 +334,17 @@ def build_graph() -> StateGraph:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_session(scenario_description: str, max_rounds: int = 3) -> dict:
-    global _log_file
+def run_session(config_path: str) -> dict:
+    global _llms, _log_file
+
+    config = load_config(config_path)
+    scenario = build_scenario(config)
+    max_rounds = scenario.get("max_rounds", 3)
+
+    _llms = {
+        key: ChatOllama(model=MODEL, temperature=(0.4 if key == "adjudicator" else 0.7))
+        for key in scenario["actors"]
+    }
 
     if ENABLE_LOGGING:
         output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -330,7 +358,7 @@ def run_session(scenario_description: str, max_rounds: int = 3) -> dict:
         "\n" + "╔" + "═" * 70 + "╗\n"
         + "║" + " MULTI-AGENT ITINERARY PLANNER ".center(70) + "║\n"
         + "╚" + "═" * 70 + "╝\n"
-        + f"\nScenario: {scenario_description}\n"
+        + f"\nScenario: {scenario['description']}\n"
     )
     _print_and_log(header)
 
@@ -343,7 +371,7 @@ def run_session(scenario_description: str, max_rounds: int = 3) -> dict:
         "round": 0,
         "max_rounds": max_rounds,
         "status": "negotiating",
-        "scenario": {"description": scenario_description},
+        "scenario": scenario,
     }
 
     graph = build_graph()
@@ -357,13 +385,11 @@ def run_session(scenario_description: str, max_rounds: int = 3) -> dict:
 
 
 def main():
-    scenario = (
-        "Plan a 3-day trip to Barcelona. You need to agree on: "
-        "(1) accommodation, (2) one must-do activity per day, "
-        "(3) where to eat dinner each night."
+    config_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "scenarios", "scenario_barcelona.yaml"
     )
-
-    run_session(scenario, max_rounds=3)
+    run_session(config_path)
 
     print("\n" + "╔" + "═" * 70 + "╗")
     print("║" + " SESSION COMPLETE ".center(70) + "║")

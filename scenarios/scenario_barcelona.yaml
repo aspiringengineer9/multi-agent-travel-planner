@@ -1,0 +1,15 @@
+scenario: "Plan a 3-day trip to Barcelona. You need to agree on: (1) accommodation, (2) one must-do activity per day, (3) where to eat dinner each night."
+topics: [accommodation, daily_activities, dinners]
+max_rounds: 3
+
+actors:
+  human_a:
+    name: "Budget Backpacker"
+    role: human
+    personality: "25-year-old grad student, hostels, street food, free walking tours, outdoor activities"
+    budget: 50        # per day, strict
+  human_b:
+    name: "Luxury Seeker"
+    role: human
+    personality: "45-year-old executive, boutique hotels, fine dining, cultural landmarks, spa experiences"
+    budget: null      # flexible
