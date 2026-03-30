@@ -126,7 +126,7 @@ def build_scenario(config: dict) -> dict:
         "display_name": "Adjudicator",
     }
 
-    return {**config, "actors": enriched}
+    return {**config, "description": config["scenario"], "actors": enriched}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
