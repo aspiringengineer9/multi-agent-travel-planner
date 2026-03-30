@@ -16,6 +16,7 @@ from typing_extensions import TypedDict
 import yaml
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+from langgraph.types import Send
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -58,11 +59,15 @@ Keep your responses to 2-3 paragraphs max.\
 # State
 # ─────────────────────────────────────────────────────────────────────────────
 
+def merge_agent_memories(existing: dict, update: dict) -> dict:
+    """Shallow-merge so parallel agent writes to different keys don't clobber each other."""
+    return {**existing, **update}
+
+
 class NegotiationState(TypedDict):
     messages: Annotated[list, add_messages]
     shared_memory: dict
-    agent_a_memory: dict
-    agent_b_memory: dict
+    agent_memories: Annotated[dict, merge_agent_memories]  # {"agent_a": {...}, ...}
     adjudicator_memory: dict
     round: int
     max_rounds: int
@@ -101,22 +106,47 @@ def _human_prompt(actor: dict) -> str:
     )
 
 
-def _agent_prompt(human: dict) -> str:
+def _agent_prompt(human: dict, agent_key: str, agent_display: str,
+                  all_agent_meta: dict, scenario_desc: str, topics: list) -> str:
     budget_line = (
         f"${human['budget']}/day strict budget — do not exceed this"
         if human.get("budget")
         else "flexible budget — comfort and quality matter more than cost"
     )
     personality = human.get("personality", "")
+
+    other_lines = []
+    for key, meta in all_agent_meta.items():
+        if key != agent_key:
+            other_lines.append(f"  - {meta['display_name']}: advocates for {meta['human_name']}")
+    other_agents_text = "\n".join(other_lines) if other_lines else "  (none)"
+
     return (
-        f"You are the advocate for {human['name']} ({budget_line}).\n"
-        f"Your human's profile: {personality}.\n"
-        "Your job is to negotiate on behalf of your human with the Adjudicator. "
-        "Argue firmly for options that fit your human's profile and budget. "
-        "Push back on proposals that don't work for your human. "
-        "Only concede on points that are genuinely acceptable given your human's constraints.\n"
-        "Always address the Adjudicator directly — never speak to the other agent.\n"
-        "Keep your responses to 2-3 paragraphs max."
+        f"=== NEGOTIATION SETUP ===\n"
+        f"Scenario: {scenario_desc}\n"
+        f"Topics under negotiation: {', '.join(topics)}\n"
+        f"Participants: An Adjudicator (neutral moderator) and {len(all_agent_meta)} advocate agents.\n"
+        f"\n"
+        f"=== YOUR IDENTITY ===\n"
+        f"You are: {agent_display}\n"
+        f"You advocate for: {human['name']}\n"
+        f"Your human's profile: {personality}\n"
+        f"Your human's budget: {budget_line}\n"
+        f"\n"
+        f"=== OTHER AGENTS ===\n"
+        f"{other_agents_text}\n"
+        f"\n"
+        f"=== YOUR INSTRUCTIONS ===\n"
+        f"1. Respond ONLY to the Adjudicator's latest question or framing.\n"
+        f"2. Argue firmly for options that fit {human['name']}'s profile and budget.\n"
+        f"3. Push back on proposals that violate {human['name']}'s constraints.\n"
+        f"4. Only concede on points genuinely acceptable to {human['name']}.\n"
+        f"5. Address the Adjudicator directly — never address another agent.\n"
+        f"6. Do NOT repeat or echo what other agents have said.\n"
+        f"7. Keep responses to 2-3 paragraphs max.\n"
+        f"\n"
+        f"IMPORTANT: You are {agent_display}. Speak in your own voice based on "
+        f"{human['name']}'s priorities. Do not copy or paraphrase other agents' positions."
     )
 
 
@@ -124,21 +154,37 @@ def build_scenario(config: dict) -> dict:
     """Enrich raw config with generated system_prompt and display_name for every actor."""
     actors = config["actors"]
     humans = {k: v for k, v in actors.items() if v["role"] == "human"}
+    scenario_desc = config["scenario"]
+    topics = config.get("topics", [])
 
     enriched: dict = {}
+    agent_meta: dict = {}  # first pass: collect agent metadata for cross-references
+
     for i, (key, human) in enumerate(humans.items(), start=1):
         letter = chr(ord("a") + i - 1)
         agent_key = f"agent_{letter}"
+        display_name = f"Agent {letter.upper()} ({human['name']} Advocate)"
 
         enriched[key] = {
             **human,
             "system_prompt": _human_prompt(human),
             "display_name": f"Human {letter.upper()} ({human['name']})",
         }
+        agent_meta[agent_key] = {
+            "display_name": display_name,
+            "human_name": human["name"],
+            "human": human,
+        }
+
+    # second pass: generate agent prompts with cross-references to other agents
+    for agent_key, meta in agent_meta.items():
         enriched[agent_key] = {
             "role": "agent",
-            "system_prompt": _agent_prompt(human),
-            "display_name": f"Agent {letter.upper()} ({human['name']} Advocate)",
+            "system_prompt": _agent_prompt(
+                meta["human"], agent_key, meta["display_name"],
+                agent_meta, scenario_desc, topics,
+            ),
+            "display_name": meta["display_name"],
         }
 
     enriched["adjudicator"] = {
@@ -147,7 +193,7 @@ def build_scenario(config: dict) -> dict:
         "display_name": "Adjudicator",
     }
 
-    return {**config, "description": config["scenario"], "actors": enriched}
+    return {**config, "description": scenario_desc, "actors": enriched}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -390,54 +436,36 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
     }
 
 
-def agent_a_node(state: NegotiationState) -> dict:
-    actor = state["scenario"]["actors"]["agent_a"]
-    round_num = state["round"]
-    my_memory = state["agent_a_memory"]
-    shared = state["shared_memory"]
+def make_agent_node(agent_key: str):
+    """Factory: return a node function for the given agent key."""
 
-    memory_context = ""
-    if my_memory:
-        memory_context += f"\nYour notes from previous rounds:\n{memory_read(my_memory)}"
-    if shared:
-        memory_context += f"\nCurrently agreed (from adjudicator):\n{memory_read(shared)}"
+    def agent_node(state: NegotiationState) -> dict:
+        actor = state["scenario"]["actors"][agent_key]
+        round_num = state["round"]
+        my_memory = state["agent_memories"].get(agent_key, {})
+        shared = state["shared_memory"]
 
-    user_content = (
-        "Respond to the Adjudicator's latest framing. Present your position "
-        "or counter-proposal on behalf of your human."
-        + (f"\n\n{memory_context}" if memory_context else "")
-    )
-    msgs = build_prompt_messages(actor["system_prompt"], state, user_content)
-    response = _llms["agent_a"].invoke(msgs)
-    _display_and_log(actor["display_name"], response.content)
-    labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
-    updated_memory = memory_write(my_memory, f"round_{round_num}_proposal", response.content)
-    return {"messages": [labeled], "agent_a_memory": updated_memory}
+        memory_context = ""
+        if my_memory:
+            memory_context += f"\nYour notes from previous rounds:\n{memory_read(my_memory)}"
+        if shared:
+            memory_context += f"\nCurrently agreed (from adjudicator):\n{memory_read(shared)}"
 
+        user_content = (
+            f"You are responding as {actor['display_name']} in Round {round_num}.\n"
+            "Respond to the Adjudicator's latest framing. Present your position "
+            "or counter-proposal on behalf of your human."
+            + (f"\n\n{memory_context}" if memory_context else "")
+        )
+        msgs = build_prompt_messages(actor["system_prompt"], state, user_content)
+        response = _llms[agent_key].invoke(msgs)
+        _display_and_log(actor["display_name"], response.content)
+        labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
+        updated_memory = memory_write(my_memory, f"round_{round_num}_proposal", response.content)
+        return {"messages": [labeled], "agent_memories": {agent_key: updated_memory}}
 
-def agent_b_node(state: NegotiationState) -> dict:
-    actor = state["scenario"]["actors"]["agent_b"]
-    round_num = state["round"]
-    my_memory = state["agent_b_memory"]
-    shared = state["shared_memory"]
-
-    memory_context = ""
-    if my_memory:
-        memory_context += f"\nYour notes from previous rounds:\n{memory_read(my_memory)}"
-    if shared:
-        memory_context += f"\nCurrently agreed (from adjudicator):\n{memory_read(shared)}"
-
-    user_content = (
-        "Respond to the Adjudicator's latest framing. Present your position "
-        "or counter-proposal on behalf of your human."
-        + (f"\n\n{memory_context}" if memory_context else "")
-    )
-    msgs = build_prompt_messages(actor["system_prompt"], state, user_content)
-    response = _llms["agent_b"].invoke(msgs)
-    _display_and_log(actor["display_name"], response.content)
-    labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
-    updated_memory = memory_write(my_memory, f"round_{round_num}_proposal", response.content)
-    return {"messages": [labeled], "agent_b_memory": updated_memory}
+    agent_node.__name__ = agent_key
+    return agent_node
 
 
 def resolution_node(state: NegotiationState) -> dict:
@@ -477,25 +505,40 @@ def resolution_node(state: NegotiationState) -> dict:
 # Routing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def after_adjudicator(state: NegotiationState) -> str:
+def after_adjudicator(state: NegotiationState) -> list:
+    """Fan-out: send identical state snapshots to all agents in parallel, or route to resolution."""
     if state["round"] >= state["max_rounds"]:
-        return "resolution"
-    return "agent_a"
+        return [Send("resolution", state)]
+    agent_keys = [
+        k for k, v in state["scenario"]["actors"].items()
+        if v["role"] == "agent"
+    ]
+    return [Send(k, state) for k in agent_keys]
+
+
+def agent_collector_node(state: NegotiationState) -> dict:
+    """No-op convergence point after parallel agent execution."""
+    return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Graph
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_graph() -> StateGraph:
+def build_graph(scenario: dict) -> StateGraph:
     builder = StateGraph(NegotiationState)
 
     builder.add_node("human_a", human_a_node)
     builder.add_node("human_b", human_b_node)
     builder.add_node("adjudicator_loop", adjudicator_loop_node)
-    builder.add_node("agent_a", agent_a_node)
-    builder.add_node("agent_b", agent_b_node)
+    builder.add_node("agent_collector", agent_collector_node)
     builder.add_node("resolution", resolution_node)
+
+    # Dynamic agent nodes from scenario config
+    agent_keys = [k for k, v in scenario["actors"].items() if v["role"] == "agent"]
+    for agent_key in agent_keys:
+        builder.add_node(agent_key, make_agent_node(agent_key))
+        builder.add_edge(agent_key, "agent_collector")
 
     builder.set_entry_point("human_a")
     builder.add_edge("human_a", "human_b")
@@ -503,10 +546,9 @@ def build_graph() -> StateGraph:
     builder.add_conditional_edges(
         "adjudicator_loop",
         after_adjudicator,
-        {"agent_a": "agent_a", "resolution": "resolution"},
+        {k: k for k in agent_keys} | {"resolution": "resolution"},
     )
-    builder.add_edge("agent_a", "agent_b")
-    builder.add_edge("agent_b", "adjudicator_loop")
+    builder.add_edge("agent_collector", "adjudicator_loop")
     builder.add_edge("resolution", END)
 
     return builder.compile()
@@ -550,8 +592,7 @@ def run_session(config_path: str) -> dict:
     initial_state: NegotiationState = {
         "messages": [],
         "shared_memory": {},
-        "agent_a_memory": {},
-        "agent_b_memory": {},
+        "agent_memories": {},
         "adjudicator_memory": {},
         "round": 0,
         "max_rounds": max_rounds,
@@ -559,7 +600,7 @@ def run_session(config_path: str) -> dict:
         "scenario": scenario,
     }
 
-    graph = build_graph()
+    graph = build_graph(scenario)
     final_state = graph.invoke(initial_state)
 
     _log_session_footer(
@@ -573,8 +614,7 @@ def run_session(config_path: str) -> dict:
         with open(memory_path, "w", encoding="utf-8") as f:
             json.dump({
                 "shared_memory": final_state.get("shared_memory", {}),
-                "agent_a_memory": final_state.get("agent_a_memory", {}),
-                "agent_b_memory": final_state.get("agent_b_memory", {}),
+                "agent_memories": final_state.get("agent_memories", {}),
                 "adjudicator_memory": final_state.get("adjudicator_memory", {}),
             }, f, indent=2)
         print(f"[LOG] Memory snapshot written to: {memory_path}")
