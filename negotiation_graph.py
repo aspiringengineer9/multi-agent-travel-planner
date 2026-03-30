@@ -344,8 +344,20 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
     labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
 
     synthesis_key = f"round_{round_num + 1}_synthesis"
-    updated_adj_memory = memory_write(adj_mem, synthesis_key, response.content[:300])
-    updated_shared = memory_write(shared, synthesis_key, response.content[:300])
+    updated_adj_memory = memory_write(adj_mem, synthesis_key, response.content)
+
+    # Extract only explicitly agreed items for shared memory — keep it clean and factual.
+    extraction_msgs = [
+        SystemMessage(content="You are a precise note-taker."),
+        HumanMessage(content=(
+            "Read the adjudicator's statement below and extract ONLY items that both parties "
+            "have explicitly agreed on. Be brief (1-3 bullet points max). "
+            "If nothing was explicitly agreed, respond with exactly: 'No agreement reached.'\n\n"
+            f"Adjudicator statement:\n{response.content}"
+        )),
+    ]
+    extraction = _llms["adjudicator"].invoke(extraction_msgs)
+    updated_shared = memory_write(shared, synthesis_key, extraction.content)
 
     return {
         "messages": [labeled],
@@ -376,7 +388,7 @@ def agent_a_node(state: NegotiationState) -> dict:
     response = _llms["agent_a"].invoke(msgs)
     _display_and_log(actor["display_name"], response.content)
     labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
-    updated_memory = memory_write(my_memory, f"round_{round_num}_proposal", response.content[:300])
+    updated_memory = memory_write(my_memory, f"round_{round_num}_proposal", response.content)
     return {"messages": [labeled], "agent_a_memory": updated_memory}
 
 
@@ -401,7 +413,7 @@ def agent_b_node(state: NegotiationState) -> dict:
     response = _llms["agent_b"].invoke(msgs)
     _display_and_log(actor["display_name"], response.content)
     labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
-    updated_memory = memory_write(my_memory, f"round_{round_num}_proposal", response.content[:300])
+    updated_memory = memory_write(my_memory, f"round_{round_num}_proposal", response.content)
     return {"messages": [labeled], "agent_b_memory": updated_memory}
 
 
