@@ -346,13 +346,16 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
     synthesis_key = f"round_{round_num + 1}_synthesis"
     updated_adj_memory = memory_write(adj_mem, synthesis_key, response.content)
 
-    # Extract only explicitly agreed items for shared memory — keep it clean and factual.
+    # Extract a structured round summary for shared memory — visible to all actors next round.
     extraction_msgs = [
-        SystemMessage(content="You are a precise note-taker."),
+        SystemMessage(content="You are a precise note-taker summarizing a negotiation round."),
         HumanMessage(content=(
-            "Read the adjudicator's statement below and extract ONLY items that both parties "
-            "have explicitly agreed on. Be brief (1-3 bullet points max). "
-            "If nothing was explicitly agreed, respond with exactly: 'No agreement reached.'\n\n"
+            "Based on the adjudicator's statement below, write a brief structured summary "
+            "with these three sections (use these exact headers):\n"
+            "AGREED: (what both parties explicitly agreed on, or 'Nothing yet')\n"
+            "DISAGREED: (the key sticking points still unresolved)\n"
+            "PROPOSED: (the adjudicator's suggested path forward or compromise)\n\n"
+            "Be concise — 1-2 lines per section.\n\n"
             f"Adjudicator statement:\n{response.content}"
         )),
     ]
