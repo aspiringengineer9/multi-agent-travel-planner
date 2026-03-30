@@ -7,6 +7,7 @@ adjudicator tracks position deltas; shared memory surfaces agreed items to all.
 
 import os
 import json
+import subprocess
 import functools
 from datetime import datetime
 from typing import Annotated
@@ -21,6 +22,22 @@ from langchain_core.messages import HumanMessage, SystemMessage
 print = functools.partial(print, flush=True)
 
 MODEL = "qwen3:8b"
+
+
+def _get_git_info() -> tuple[str, str]:
+    repo = os.path.dirname(os.path.abspath(__file__))
+    try:
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        return branch, commit
+    except Exception:
+        return "unknown", "unknown"
 ENABLE_LOGGING = True
 SEPARATOR = "═" * 72
 
@@ -162,12 +179,15 @@ def _log_session_header(config_path: str, scenario: dict, started_at: datetime):
 
     actors = scenario["actors"]
     topics = ", ".join(scenario.get("topics", []))
+    branch, commit = _get_git_info()
 
     lines = [
         "╔" + "═" * 70 + "╗",
         "║" + " SESSION METADATA ".center(70) + "║",
         "╚" + "═" * 70 + "╝",
         f"  Started   : {started_at.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  Branch    : {branch}",
+        f"  Commit    : {commit}",
         f"  Config    : {os.path.abspath(config_path)}",
         f"  Model     : {MODEL}",
         f"  Max rounds: {scenario.get('max_rounds', 3)}",
