@@ -6,6 +6,7 @@ adjudicator tracks position deltas; shared memory surfaces agreed items to all.
 """
 
 import os
+import re
 import json
 import subprocess
 import functools
@@ -18,11 +19,28 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.types import Send
 from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 
 print = functools.partial(print, flush=True)
 
 MODEL = "qwen3:8b"
+
+
+def _load_dotenv():
+    """Load .env file from the same directory as this script into os.environ."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_dotenv()
 
 
 def _get_git_info() -> tuple[str, str]:
@@ -44,12 +62,20 @@ SEPARATOR = "═" * 72
 
 ADJUDICATOR_PROMPT = """\
 You are the Adjudicator — a neutral moderator mediating between the agents representing each traveler.
+
 Your responsibilities:
 - Summarize the current state of agreement and disagreement.
 - Identify potential compromises neither agent has considered.
+- Use the proposal_scorer tool to quantitatively compare competing proposals when agents are stuck.
 - Frame specific questions or trade-offs for agents to respond to.
 - Call for decisions when discussion stalls.
-- Declare consensus when reached, or declare impasse after all rounds.
+
+CONSENSUS DETECTION:
+- If both agents have explicitly agreed on all negotiation topics, call the declare_outcome tool with status='consensus'.
+- If agents have agreed on some topics but remain stuck on others after substantive discussion, call declare_outcome with status='partial_consensus'.
+- If agents are repeating positions with no movement after 2+ rounds of the same arguments, call declare_outcome with status='impasse'.
+- Do NOT declare consensus unless agents have EXPLICITLY agreed. Silence or lack of objection is not agreement.
+
 Always be fair, balanced, and constructive.
 Keep your responses to 2-3 paragraphs max.\
 """
@@ -107,7 +133,9 @@ def _human_prompt(actor: dict) -> str:
 
 
 def _agent_prompt(human: dict, agent_key: str, agent_display: str,
-                  all_agent_meta: dict, scenario_desc: str, topics: list) -> str:
+                  all_agent_meta: dict, scenario_desc: str, topics: list,
+                  deliberation_points: list | None = None,
+                  travel_context: dict | None = None) -> str:
     budget_line = (
         f"${human['budget']}/day strict budget — do not exceed this"
         if human.get("budget")
@@ -121,10 +149,17 @@ def _agent_prompt(human: dict, agent_key: str, agent_display: str,
             other_lines.append(f"  - {meta['display_name']}: advocates for {meta['human_name']}")
     other_agents_text = "\n".join(other_lines) if other_lines else "  (none)"
 
+    delib_text = ""
+    if deliberation_points:
+        delib_text = "\nSpecific decisions to negotiate:\n" + "\n".join(
+            f"  - {dp}" for dp in deliberation_points
+        ) + "\n"
+
     return (
         f"=== NEGOTIATION SETUP ===\n"
         f"Scenario: {scenario_desc}\n"
         f"Topics under negotiation: {', '.join(topics)}\n"
+        f"{delib_text}"
         f"Participants: An Adjudicator (neutral moderator) and {len(all_agent_meta)} advocate agents.\n"
         f"\n"
         f"=== YOUR IDENTITY ===\n"
@@ -143,10 +178,26 @@ def _agent_prompt(human: dict, agent_key: str, agent_display: str,
         f"4. Only concede on points genuinely acceptable to {human['name']}.\n"
         f"5. Address the Adjudicator directly — never address another agent.\n"
         f"6. Do NOT repeat or echo what other agents have said.\n"
-        f"7. Keep responses to 2-3 paragraphs max.\n"
+        f"7. Use the budget_calculator tool to verify whether proposals fit within your human's budget.\n"
+        f"8. Use flight_search and hotel_search to ground your proposals in real options — "
+        f"always search before recommending specific flights or hotels.\n"
+        f"9. Use date_feasibility_check to verify travel dates before committing to them.\n"
+        f"10. If a tool returns an error, retry with adjusted parameters (different date format, "
+        f"airport code instead of city name, etc.) before falling back to estimates.\n"
+        f"11. Keep responses to 2-3 paragraphs max.\n"
         f"\n"
         f"IMPORTANT: You are {agent_display}. Speak in your own voice based on "
         f"{human['name']}'s priorities. Do not copy or paraphrase other agents' positions."
+        + (
+            f"\n\n=== TRIP DETAILS ===\n"
+            f"Destination: {travel_context.get('destination', 'N/A')}\n"
+            f"Departure city: {travel_context.get('departure_city', 'N/A')}\n"
+            f"Outbound: {travel_context.get('outbound_date', 'N/A')} "
+            f"({travel_context.get('departure_airport', '')} → {travel_context.get('arrival_airport', '')})\n"
+            f"Return: {travel_context.get('return_date', 'N/A')}\n"
+            f"Hotel check-in: {travel_context.get('check_in', 'N/A')} / check-out: {travel_context.get('check_out', 'N/A')}"
+            if travel_context else ""
+        )
     )
 
 
@@ -156,6 +207,8 @@ def build_scenario(config: dict) -> dict:
     humans = {k: v for k, v in actors.items() if v["role"] == "human"}
     scenario_desc = config["scenario"]
     topics = config.get("topics", [])
+    deliberation_points = config.get("deliberation_points")
+    travel_context = config.get("travel_context")
 
     enriched: dict = {}
     agent_meta: dict = {}  # first pass: collect agent metadata for cross-references
@@ -182,7 +235,7 @@ def build_scenario(config: dict) -> dict:
             "role": "agent",
             "system_prompt": _agent_prompt(
                 meta["human"], agent_key, meta["display_name"],
-                agent_meta, scenario_desc, topics,
+                agent_meta, scenario_desc, topics, deliberation_points, travel_context,
             ),
             "display_name": meta["display_name"],
         }
@@ -308,6 +361,273 @@ def memory_write(memory: dict, key: str, value: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def budget_calculator(items: list[dict], daily_budget: float, num_days: int = 1) -> str:
+    """Calculate whether proposed itinerary items fit within a daily budget.
+
+    Args:
+        items: List of items, each with 'name' (str), 'cost_per_day' (float),
+               and 'category' (str — e.g. accommodation, food, activity, transport).
+        daily_budget: The daily budget cap in dollars.
+        num_days: Number of trip days (default 1).
+    """
+    by_category: dict[str, float] = {}
+    for item in items:
+        cat = item.get("category", "other")
+        by_category[cat] = by_category.get(cat, 0) + item.get("cost_per_day", 0)
+
+    total_daily = sum(by_category.values())
+    total_trip = total_daily * num_days
+    budget_trip = daily_budget * num_days
+    remaining = budget_trip - total_trip
+    verdict = "WITHIN_BUDGET" if remaining >= 0 else "OVER_BUDGET"
+
+    lines = [f"Daily cost breakdown:"]
+    for cat, cost in sorted(by_category.items()):
+        lines.append(f"  {cat}: ${cost:.2f}")
+    lines.append(f"Total daily cost: ${total_daily:.2f}")
+    lines.append(f"Daily budget: ${daily_budget:.2f}")
+    lines.append(f"Remaining: ${remaining:.2f}")
+    lines.append(f"Verdict: {verdict}")
+    return "\n".join(lines)
+
+
+@tool
+def proposal_scorer(
+    proposal: str,
+    budget_a: float,
+    budget_b: float | None,
+    estimated_daily_cost: float,
+    comfort_level: int,
+    experience_richness: int,
+) -> str:
+    """Score a proposal on weighted criteria to help break deadlocks.
+
+    Args:
+        proposal: Brief description of the proposal being scored.
+        budget_a: Human A's daily budget.
+        budget_b: Human B's daily budget (None if flexible).
+        estimated_daily_cost: Estimated daily cost of this proposal.
+        comfort_level: 1-10 rating of comfort/luxury level.
+        experience_richness: 1-10 rating of cultural/experiential value.
+    """
+    # Cost fit (40%): penalize if over strict budget, reward middle ground
+    budgets = [b for b in [budget_a, budget_b] if b is not None]
+    if budgets:
+        min_budget = min(budgets)
+        if estimated_daily_cost <= min_budget:
+            cost_score = 10
+        elif estimated_daily_cost <= min_budget * 1.2:
+            cost_score = 6
+        elif estimated_daily_cost <= min_budget * 1.5:
+            cost_score = 3
+        else:
+            cost_score = 1
+    else:
+        cost_score = 8  # both flexible
+
+    comfort_score = max(1, min(10, comfort_level))
+    experience_score = max(1, min(10, experience_richness))
+
+    weighted = (cost_score * 0.4 + comfort_score * 0.3 + experience_score * 0.3) * 10
+    weighted = round(weighted, 1)
+
+    return (
+        f"Proposal: {proposal}\n"
+        f"  Cost fit:    {cost_score}/10 (weight 40%) — est. ${estimated_daily_cost:.0f}/day\n"
+        f"  Comfort:     {comfort_score}/10 (weight 30%)\n"
+        f"  Experience:  {experience_score}/10 (weight 30%)\n"
+        f"  TOTAL SCORE: {weighted}/100"
+    )
+
+
+@tool
+def declare_outcome(status: str, reasoning: str) -> str:
+    """Declare the negotiation outcome. Call this when consensus is reached or impasse is clear.
+
+    Args:
+        status: One of 'consensus', 'partial_consensus', 'impasse'.
+        reasoning: Brief explanation of why this outcome was declared.
+    """
+    valid = {"consensus", "partial_consensus", "impasse"}
+    if status not in valid:
+        return f"Invalid status '{status}'. Must be one of: {', '.join(sorted(valid))}"
+    return f"Outcome declared: {status}. Reason: {reasoning}"
+
+
+@tool
+def flight_search(origin: str, destination: str, outbound_date: str, return_date: str | None = None) -> str:
+    """Search for available flights using real-time data.
+
+    Args:
+        origin: Departure city or airport code (e.g. 'New York' or 'JFK').
+        destination: Arrival city or airport code (e.g. 'Barcelona' or 'BCN').
+        outbound_date: Departure date in YYYY-MM-DD format.
+        return_date: Return date in YYYY-MM-DD format (omit for one-way).
+
+    Returns:
+        Top 3 flight options with airline, price, duration, and stops.
+    """
+    api_key = os.environ.get("SERPAPI_KEY")
+    if not api_key:
+        return "Tool error: SERPAPI_KEY not set in environment."
+    try:
+        from serpapi import GoogleSearch
+        params = {
+            "engine": "google_flights",
+            "departure_id": origin,
+            "arrival_id": destination,
+            "outbound_date": outbound_date,
+            "currency": "USD",
+            "hl": "en",
+            "api_key": api_key,
+            "type": "1" if return_date else "2",
+        }
+        if return_date:
+            params["return_date"] = return_date
+        results = GoogleSearch(params).get_dict()
+        if "error" in results:
+            return f"Flight search error: {results['error']}"
+        flights = results.get("best_flights") or results.get("other_flights") or []
+        if not flights:
+            return f"No flights found from {origin} to {destination} on {outbound_date}."
+        lines = [f"Flights from {origin} to {destination} on {outbound_date}:"]
+        for i, group in enumerate(flights[:3], 1):
+            legs = group.get("flights", [{}])
+            airline = legs[0].get("airline", "Unknown") if legs else "Unknown"
+            price = group.get("price", "N/A")
+            duration = group.get("total_duration", "N/A")
+            stops = len(legs) - 1
+            stop_text = "nonstop" if stops == 0 else f"{stops} stop(s)"
+            lines.append(f"  {i}. {airline} — ${price} — {duration} min — {stop_text}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Flight search error: {e}"
+
+
+@tool
+def hotel_search(destination: str, check_in: str, check_out: str, max_price_per_night: float | None = None) -> str:
+    """Search for available hotels at the destination.
+
+    Args:
+        destination: City or area to search hotels in (e.g. 'Barcelona, Spain').
+        check_in: Check-in date in YYYY-MM-DD format.
+        check_out: Check-out date in YYYY-MM-DD format.
+        max_price_per_night: Optional maximum price per night in USD.
+
+    Returns:
+        Top 3 hotel options with name, price per night, rating, and amenities.
+    """
+    api_key = os.environ.get("SERPAPI_KEY")
+    if not api_key:
+        return "Tool error: SERPAPI_KEY not set in environment."
+    try:
+        from serpapi import GoogleSearch
+        params = {
+            "engine": "google_hotels",
+            "q": f"hotels in {destination}",
+            "check_in_date": check_in,
+            "check_out_date": check_out,
+            "currency": "USD",
+            "hl": "en",
+            "api_key": api_key,
+        }
+        results = GoogleSearch(params).get_dict()
+        if "error" in results:
+            return f"Hotel search error: {results['error']}"
+        properties = results.get("properties", [])
+        if not properties:
+            return f"No hotels found in {destination} for {check_in} to {check_out}."
+        if max_price_per_night:
+            filtered = [
+                p for p in properties
+                if (p.get("rate_per_night") or {}).get("extracted_lowest", float("inf")) <= max_price_per_night
+            ]
+            if filtered:
+                properties = filtered
+        lines = [f"Hotels in {destination} ({check_in} to {check_out}):"]
+        for i, hotel in enumerate(properties[:3], 1):
+            name = hotel.get("name", "Unknown hotel")
+            rate = (hotel.get("rate_per_night") or {}).get("lowest", "N/A")
+            rating = hotel.get("overall_rating", "N/A")
+            amenities = ", ".join((hotel.get("amenities") or [])[:3]) or "N/A"
+            lines.append(f"  {i}. {name} — {rate}/night — {rating}★ — {amenities}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Hotel search error: {e}"
+
+
+@tool
+def date_feasibility_check(outbound_date: str, return_date: str, constraints: list[str] | None = None) -> str:
+    """Check whether proposed travel dates are feasible.
+
+    Args:
+        outbound_date: Departure date in YYYY-MM-DD format.
+        return_date: Return date in YYYY-MM-DD format.
+        constraints: Optional list of blocked date ranges, e.g. ['2025-09-01 to 2025-09-05'].
+
+    Returns:
+        FEASIBLE: <summary> or INFEASIBLE: <reason>
+    """
+    try:
+        from datetime import date as date_type
+        outbound = datetime.strptime(outbound_date, "%Y-%m-%d").date()
+        ret = datetime.strptime(return_date, "%Y-%m-%d").date()
+        today = date_type.today()
+        if outbound <= today:
+            return "INFEASIBLE: Outbound date must be in the future."
+        if ret < outbound:
+            return "INFEASIBLE: Return date must be on or after outbound date."
+        duration = (ret - outbound).days
+        if duration > 30:
+            return f"INFEASIBLE: Trip of {duration} days exceeds 30-day limit."
+        if constraints:
+            for constraint in constraints:
+                parts = constraint.split(" to ")
+                if len(parts) == 2:
+                    try:
+                        block_start = datetime.strptime(parts[0].strip(), "%Y-%m-%d").date()
+                        block_end = datetime.strptime(parts[1].strip(), "%Y-%m-%d").date()
+                        if not (ret < block_start or outbound > block_end):
+                            return f"INFEASIBLE: Dates overlap with blocked period '{constraint}'."
+                    except ValueError:
+                        pass
+        return f"FEASIBLE: {duration}-day trip from {outbound_date} to {return_date}."
+    except ValueError as e:
+        return f"INFEASIBLE: Invalid date format — {e}. Use YYYY-MM-DD."
+
+
+AGENT_TOOLS = [budget_calculator, flight_search, hotel_search, date_feasibility_check]
+ADJUDICATOR_TOOLS = [proposal_scorer, declare_outcome]
+
+_AGENT_TOOLS_BY_NAME = {t.name: t for t in AGENT_TOOLS}
+_ADJUDICATOR_TOOLS_BY_NAME = {t.name: t for t in ADJUDICATOR_TOOLS}
+
+
+def _execute_tool_calls(response: AIMessage, tools_by_name: dict) -> list[ToolMessage]:
+    """Extract and execute tool calls from an AIMessage. Returns list of ToolMessage."""
+    if not hasattr(response, "tool_calls") or not response.tool_calls:
+        return []
+    results = []
+    for tc in response.tool_calls:
+        tool_fn = tools_by_name.get(tc["name"])
+        if tool_fn:
+            try:
+                result = tool_fn.invoke(tc["args"])
+                results.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+            except Exception as e:
+                results.append(ToolMessage(content=f"Tool error: {e}", tool_call_id=tc["id"]))
+        else:
+            results.append(ToolMessage(
+                content=f"Unknown tool: {tc['name']}", tool_call_id=tc["id"]
+            ))
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -329,9 +649,38 @@ def inject_think_prefix(messages: list) -> list:
     return result
 
 
+def _extract_round_summary(text: str) -> str:
+    """Parse AGREED/DISAGREED/PROPOSED sections from adjudicator response.
+
+    Falls back to storing the full response if structured sections aren't found.
+    """
+    sections = {}
+    for header in ("AGREED", "DISAGREED", "PROPOSED"):
+        match = re.search(
+            rf"{header}\s*:\s*(.+?)(?=\n(?:AGREED|DISAGREED|PROPOSED)\s*:|$)",
+            text, re.DOTALL | re.IGNORECASE,
+        )
+        if match:
+            sections[header] = match.group(1).strip()
+    if sections:
+        return "\n".join(f"{k}: {v}" for k, v in sections.items())
+    return text  # fallback: store full response
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Nodes
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _static_human_statement(actor: dict) -> str:
+    """Build a preference statement directly from config — no LLM call needed."""
+    parts = [actor.get("personality", "").strip()]
+    budget = actor.get("budget")
+    if budget:
+        parts.append(f"My budget is strictly ${budget}/day.")
+    else:
+        parts.append("My budget is flexible — comfort matters more than cost.")
+    return " ".join(parts)
+
 
 def human_a_node(state: NegotiationState) -> dict:
     _print_and_log("\n" + "─" * 72)
@@ -339,27 +688,17 @@ def human_a_node(state: NegotiationState) -> dict:
     _print_and_log("─" * 72)
 
     actor = state["scenario"]["actors"]["human_a"]
-    msgs = build_prompt_messages(
-        actor["system_prompt"], state,
-        f"A trip is being planned. Here is the scenario: {state['scenario']['description']}\n"
-        "Please state your preferences and constraints as a traveler."
-    )
-    response = _llms["human_a"].invoke(msgs)
-    _display_and_log(actor["display_name"], response.content)
-    labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
+    statement = _static_human_statement(actor)
+    _display_and_log(actor["display_name"], statement)
+    labeled = HumanMessage(content=f"[{actor['display_name']}]: {statement}")
     return {"messages": [labeled]}
 
 
 def human_b_node(state: NegotiationState) -> dict:
     actor = state["scenario"]["actors"]["human_b"]
-    msgs = build_prompt_messages(
-        actor["system_prompt"], state,
-        f"A trip is being planned. Here is the scenario: {state['scenario']['description']}\n"
-        "Please state your preferences and constraints as a traveler."
-    )
-    response = _llms["human_b"].invoke(msgs)
-    _display_and_log(actor["display_name"], response.content)
-    labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
+    statement = _static_human_statement(actor)
+    _display_and_log(actor["display_name"], statement)
+    labeled = HumanMessage(content=f"[{actor['display_name']}]: {statement}")
     return {"messages": [labeled]}
 
 
@@ -368,6 +707,7 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
     max_rounds = state["max_rounds"]
     actor = state["scenario"]["actors"]["adjudicator"]
     topics = ", ".join(state["scenario"].get("topics", []))
+    delib_points = state["scenario"].get("deliberation_points")
 
     if round_num == 0:
         _print_and_log("\n" + "─" * 72)
@@ -377,18 +717,45 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
     _print_and_log(f"\n{'▸'*3} ROUND {round_num + 1} of {max_rounds} {'◂'*3}")
 
     if round_num == 0:
+        delib_text = ""
+        if delib_points:
+            delib_text = "\nSpecific decisions to resolve:\n" + "\n".join(
+                f"  - {dp}" for dp in delib_points
+            ) + "\n"
         adj_prompt = (
             "You have heard both travelers' preferences. "
             f"Topics to negotiate: {topics}. "
+            f"{delib_text}"
             "Frame the first key trade-off or question for the agents to discuss. "
-            "Focus on one topic at a time."
+            "Focus on one topic at a time.\n\n"
+            "End your response with a status block in this exact format:\n"
+            "AGREED: [what both agents explicitly agreed on, or 'Nothing yet']\n"
+            "DISAGREED: [key sticking points still unresolved]\n"
+            "PROPOSED: [your suggested compromise or next step]"
+        )
+    elif round_num == max_rounds - 1:
+        adj_prompt = (
+            "This is the FINAL round. You must now declare an outcome.\n\n"
+            "1. Optionally call proposal_scorer to evaluate the best compromise on the table.\n"
+            "2. Then call declare_outcome with the appropriate status:\n"
+            "   - 'consensus' if a viable compromise was reached (agents converging, even implicitly)\n"
+            "   - 'partial_consensus' if some topics resolved but others remain stuck\n"
+            "   - 'impasse' if positions are irreconcilable\n"
+            "You MUST call declare_outcome — do not end this round without it.\n\n"
+            "End your response with a status block in this exact format:\n"
+            "AGREED: [what was resolved]\n"
+            "DISAGREED: [what remains unresolved, or 'None']\n"
+            "PROPOSED: [the final agreed plan, or best available compromise]"
         )
     else:
         adj_prompt = (
             "Based on the agents' responses, synthesize their positions. "
             "If progress was made, move to the next topic. "
-            "If stuck, propose a creative compromise. "
-            "If this is the final round, begin wrapping up toward a resolution."
+            "If stuck, propose a creative compromise or use the proposal_scorer tool to compare options.\n\n"
+            "End your response with a status block in this exact format:\n"
+            "AGREED: [what both agents explicitly agreed on, or 'Nothing yet']\n"
+            "DISAGREED: [key sticking points still unresolved]\n"
+            "PROPOSED: [your suggested compromise or next step]"
         )
 
     adj_mem = state["adjudicator_memory"]
@@ -403,8 +770,23 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
     adj_prompt_full = adj_prompt + (f"\n\n{memory_context}" if memory_context else "")
 
     msgs = build_prompt_messages(actor["system_prompt"], state, adj_prompt_full)
-    msgs = inject_think_prefix(msgs)
     response = _llms["adjudicator"].invoke(msgs)
+
+    # Inline tool execution: handle proposal_scorer and declare_outcome calls
+    declared_status = None
+    tool_msgs = _execute_tool_calls(response, _ADJUDICATOR_TOOLS_BY_NAME)
+    if tool_msgs:
+        for tc in (response.tool_calls or []):
+            if tc["name"] == "declare_outcome":
+                declared_status = tc["args"].get("status")
+                _print_and_log(f"  [TOOL] declare_outcome → {declared_status}: {tc['args'].get('reasoning', '')}")
+            else:
+                _print_and_log(f"  [TOOL] {tc['name']} called")
+
+    # Path A: if tools fired or content is empty, re-invoke adjudicator_think with tool results in context
+    if tool_msgs or not response.content or not response.content.strip():
+        msgs_with_tools = msgs + [response] + tool_msgs
+        response = _llms["adjudicator_think"].invoke(msgs_with_tools)
 
     _display_and_log(f"{actor['display_name']} (Round {round_num + 1})", response.content)
     labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
@@ -412,28 +794,19 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
     synthesis_key = f"round_{round_num + 1}_synthesis"
     updated_adj_memory = memory_write(adj_mem, synthesis_key, response.content)
 
-    # Extract a structured round summary for shared memory — visible to all actors next round.
-    extraction_msgs = [
-        SystemMessage(content="You are a precise note-taker summarizing a negotiation round."),
-        HumanMessage(content=(
-            "Based on the adjudicator's statement below, write a brief structured summary "
-            "with these three sections (use these exact headers):\n"
-            "AGREED: (what both parties explicitly agreed on, or 'Nothing yet')\n"
-            "DISAGREED: (the key sticking points still unresolved)\n"
-            "PROPOSED: (the adjudicator's suggested path forward or compromise)\n\n"
-            "Be concise — 1-2 lines per section.\n\n"
-            f"Adjudicator statement:\n{response.content}"
-        )),
-    ]
-    extraction = _llms["adjudicator"].invoke(extraction_msgs)
-    updated_shared = memory_write(shared, synthesis_key, extraction.content)
+    # Parse structured round summary from adjudicator's response (no extra LLM call)
+    summary = _extract_round_summary(response.content)
+    updated_shared = memory_write(shared, synthesis_key, summary)
 
-    return {
+    result = {
         "messages": [labeled],
         "round": round_num + 1,
         "adjudicator_memory": updated_adj_memory,
         "shared_memory": updated_shared,
     }
+    if declared_status:
+        result["status"] = declared_status
+    return result
 
 
 def make_agent_node(agent_key: str):
@@ -458,7 +831,21 @@ def make_agent_node(agent_key: str):
             + (f"\n\n{memory_context}" if memory_context else "")
         )
         msgs = build_prompt_messages(actor["system_prompt"], state, user_content)
-        response = _llms[agent_key].invoke(msgs)
+
+        # ReAct loop: reason → act → observe → repeat until no more tool calls
+        MAX_REACT_ITERS = 4
+        messages = msgs
+        for iteration in range(MAX_REACT_ITERS):
+            response = _llms[agent_key].invoke(messages)
+            tool_msgs = _execute_tool_calls(response, _AGENT_TOOLS_BY_NAME)
+            if not tool_msgs:
+                break
+            for tc in (response.tool_calls or []):
+                _print_and_log(
+                    f"  [ReAct {iteration + 1}] {actor['display_name']} → {tc['name']}"
+                )
+            messages = messages + [response] + tool_msgs
+
         _display_and_log(actor["display_name"], response.content)
         labeled = HumanMessage(content=f"[{actor['display_name']}]: {response.content}")
         updated_memory = memory_write(my_memory, f"round_{round_num}_proposal", response.content)
@@ -483,22 +870,43 @@ def resolution_node(state: NegotiationState) -> dict:
     if shared:
         memory_context += f"\nCurrently agreed items:\n{memory_read(shared)}"
 
+    # If status was already set by declare_outcome, preserve it; otherwise determine from response
+    current_status = state["status"]
+    status_context = ""
+    if current_status in ("consensus", "partial_consensus", "impasse"):
+        status_context = f"\nThe negotiation was concluded with status: {current_status}.\n"
+
     resolution_prompt = (
         "All negotiation rounds are complete. Declare the final outcome:\n"
+        f"{status_context}"
         "- State whether consensus was reached, partial agreement, or impasse.\n"
         "- Provide a structured summary of what was agreed for each topic.\n"
         "- Note any unresolved disagreements."
         + (f"\n\n{memory_context}" if memory_context else "")
     )
     msgs = build_prompt_messages(actor["system_prompt"], state, resolution_prompt)
+    # Use adjudicator_think (no tools bound) so /think prefix works for deeper reasoning
     msgs = inject_think_prefix(msgs)
-    response = _llms["adjudicator"].invoke(msgs)
+    response = _llms["adjudicator_think"].invoke(msgs)
 
     _display_and_log(f"{actor['display_name']} (Final Resolution)", response.content)
     labeled = HumanMessage(
         content=f"[{actor['display_name']} (Final Resolution)]: {response.content}"
     )
-    return {"messages": [labeled], "status": "consensus"}
+
+    # Use declared status if available; otherwise infer from response text
+    if current_status not in ("consensus", "partial_consensus", "impasse"):
+        text_lower = response.content.lower()
+        if "consensus" in text_lower and "partial" not in text_lower:
+            final_status = "consensus"
+        elif "impasse" in text_lower:
+            final_status = "impasse"
+        else:
+            final_status = "partial_consensus"
+    else:
+        final_status = current_status
+
+    return {"messages": [labeled], "status": final_status}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -507,6 +915,10 @@ def resolution_node(state: NegotiationState) -> dict:
 
 def after_adjudicator(state: NegotiationState) -> list:
     """Fan-out: send identical state snapshots to all agents in parallel, or route to resolution."""
+    # Early termination: adjudicator declared outcome via declare_outcome tool
+    if state["status"] in ("consensus", "partial_consensus", "impasse"):
+        _print_and_log(f"  ⇒ Early termination: {state['status']}")
+        return [Send("resolution", state)]
     if state["round"] >= state["max_rounds"]:
         return [Send("resolution", state)]
     agent_keys = [
@@ -565,10 +977,20 @@ def run_session(config_path: str) -> dict:
     scenario = build_scenario(config)
     max_rounds = scenario.get("max_rounds", 3)
 
-    _llms = {
-        key: ChatOllama(model=MODEL, temperature=(0.4 if key == "adjudicator" else 0.7))
-        for key in scenario["actors"]
-    }
+    # Enable parallel Ollama requests — M3 Air 16GB can handle 2 concurrent requests
+    os.environ.setdefault("OLLAMA_NUM_PARALLEL", "2")
+
+    _llms = {}
+    for key, actor in scenario["actors"].items():
+        if key == "adjudicator":
+            adj_base = ChatOllama(model=MODEL, temperature=0.4)
+            _llms[key] = adj_base.bind_tools(ADJUDICATOR_TOOLS)  # tools, no /think
+            _llms["adjudicator_think"] = adj_base                 # /think, no tools
+        elif actor["role"] == "agent":
+            base = ChatOllama(model=MODEL, temperature=0.7)
+            _llms[key] = base.bind_tools(AGENT_TOOLS)
+        else:
+            _llms[key] = ChatOllama(model=MODEL, temperature=0.7)
 
     started_at = datetime.now()
 
@@ -629,7 +1051,7 @@ def run_session(config_path: str) -> dict:
 def main():
     config_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "scenarios", "scenario_barcelona.yaml"
+        "scenarios", "scenario_la.yaml"
     )
     run_session(config_path)
 

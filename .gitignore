@@ -16,10 +16,12 @@ env/
 
 # Output logs from runs
 output/
+tmp/
 
 # Environment / secrets
 .env
 *.env
+!.env.example
 
 # IDE
 .vscode/

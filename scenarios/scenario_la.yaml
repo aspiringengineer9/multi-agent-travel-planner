@@ -1,0 +1,42 @@
+scenario: >
+  Plan a 1-day trip to Los Angeles. Two friends need to agree on how to
+  spend the day together. They have already agreed to end at Santa Monica
+  Pier for sunset and dinner — the negotiation is about the daytime.
+
+topics: [morning_activity, afternoon_activity, transport]
+
+deliberation_points:
+  - "Morning: Griffith Observatory & Hollywood area vs. heading straight to the beach"
+  - "Afternoon: Venice Beach boardwalk & beach time vs. more Hollywood sightseeing"
+  - "Transport: How to get between locations — LA Metro (budget) vs. Uber/Lyft (~$20 per ride)"
+
+max_rounds: 2
+
+travel_context:
+  destination: "Los Angeles, CA"
+  departure_city: "San Francisco"
+  departure_airport: "SFO"
+  arrival_airport: "LAX"
+  outbound_date: "2025-09-20"
+  return_date: "2025-09-20"
+  check_in: "2025-09-20"
+  check_out: "2025-09-20"
+
+actors:
+  human_a:
+    name: "Culture Buff"
+    role: human
+    personality: >
+      Loves sightseeing and landmarks. Wants to visit Griffith Observatory
+      for the views, walk the Hollywood Walk of Fame, and soak in the city.
+      Budget-conscious — prefers LA Metro and walking over rideshare.
+    budget: 40  # per day, strict — covers transit + food + any entry fees
+
+  human_b:
+    name: "Beach Bum"
+    role: human
+    personality: >
+      All about the coast. Wants to spend as much time as possible at
+      Venice Beach — boardwalk, volleyball, maybe surfing. Happy to Uber
+      between spots to save time. Flexible on spending.
+    budget: null  # flexible

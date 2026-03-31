@@ -2,6 +2,16 @@ scenario: "Plan a 3-day trip to Barcelona. You need to agree on: (1) accommodati
 topics: [accommodation, daily_activities, dinners]
 max_rounds: 3
 
+travel_context:
+  destination: "Barcelona, Spain"
+  departure_city: "New York"
+  departure_airport: "JFK"
+  arrival_airport: "BCN"
+  outbound_date: "2025-09-10"
+  return_date: "2025-09-13"
+  check_in: "2025-09-10"
+  check_out: "2025-09-13"
+
 actors:
   human_a:
     name: "Budget Backpacker"
