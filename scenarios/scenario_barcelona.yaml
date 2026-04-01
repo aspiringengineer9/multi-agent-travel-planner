@@ -7,10 +7,10 @@ travel_context:
   departure_city: "New York"
   departure_airport: "JFK"
   arrival_airport: "BCN"
-  outbound_date: "2025-09-10"
-  return_date: "2025-09-13"
-  check_in: "2025-09-10"
-  check_out: "2025-09-13"
+  outbound_date: "2026-06-10"
+  return_date: "2026-06-13"
+  check_in: "2026-06-10"
+  check_out: "2026-06-13"
 
 actors:
   human_a:

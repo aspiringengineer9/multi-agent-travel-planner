@@ -254,6 +254,14 @@ def build_scenario(config: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _log_file = None
+_events_file = None
+
+
+def _log_event(event: dict) -> None:
+    """Append a JSON-lines event to the events log for metric collection."""
+    if _events_file:
+        _events_file.write(json.dumps(event) + "\n")
+        _events_file.flush()
 
 
 def _display_and_log(speaker: str, content: str):
@@ -262,6 +270,7 @@ def _display_and_log(speaker: str, content: str):
     if _log_file:
         _log_file.write(block + "\n")
         _log_file.flush()
+    _log_event({"type": "turn", "speaker": speaker})
 
 
 def _print_and_log(text: str):
@@ -607,7 +616,64 @@ _AGENT_TOOLS_BY_NAME = {t.name: t for t in AGENT_TOOLS}
 _ADJUDICATOR_TOOLS_BY_NAME = {t.name: t for t in ADJUDICATOR_TOOLS}
 
 
-def _execute_tool_calls(response: AIMessage, tools_by_name: dict) -> list[ToolMessage]:
+def _build_retry_hint(tool_name: str, result_str: str, args: dict) -> str | None:
+    """Return a targeted, actionable retry hint for a failed tool call, or None if not applicable.
+
+    The hint is appended to the ToolMessage so the LLM sees exactly what to change on the
+    next ReAct iteration — deterministic error classification, LLM-driven corrective action.
+    """
+    low = result_str.lower()
+
+    if tool_name == "hotel_search":
+        if "no hotels found" in low:
+            dest = args.get("destination", "")
+            return (
+                f"[RETRY HINT] No results for '{dest}'. Try: "
+                f"(1) append country e.g. '{dest}, Spain' or '{dest}, USA', "
+                f"(2) use a broader area name, "
+                f"(3) remove max_price_per_night filter if set."
+            )
+        if "hotel search error" in low or "tool error" in low:
+            return (
+                "[RETRY HINT] API error on hotel_search. Try: "
+                "(1) use 'City, Country' format for destination, "
+                "(2) confirm dates are YYYY-MM-DD and in the future."
+            )
+
+    if tool_name == "flight_search":
+        if "no flights found" in low:
+            origin = args.get("origin", "")
+            dest = args.get("destination", "")
+            return (
+                f"[RETRY HINT] No flights for '{origin}'→'{dest}'. Try: "
+                f"(1) use IATA airport codes instead of city names "
+                f"(e.g. 'JFK' not 'New York', 'BCN' not 'Barcelona', 'LAX' not 'Los Angeles'), "
+                f"(2) try a nearby major airport."
+            )
+        if "flight search error" in low or "tool error" in low:
+            return (
+                "[RETRY HINT] API error on flight_search. Try: "
+                "(1) use IATA airport codes (JFK, LAX, BCN, LHR, ORD, MCO, SFO, RNO), "
+                "(2) confirm date format is YYYY-MM-DD."
+            )
+
+    if tool_name == "date_feasibility_check":
+        if "outbound date must be in the future" in low:
+            return (
+                "[RETRY HINT] Dates are in the past. Use the future dates shown in your "
+                "trip details (outbound_date / return_date fields in your system prompt)."
+            )
+        if "invalid date format" in low:
+            return (
+                "[RETRY HINT] Wrong date format. Use YYYY-MM-DD "
+                "(e.g. '2026-06-10', not '06/10/2026' or 'June 10, 2026')."
+            )
+
+    return None
+
+
+def _execute_tool_calls(response: AIMessage, tools_by_name: dict,
+                         _ctx_agent: str = "", _ctx_round: int = 0) -> list[ToolMessage]:
     """Extract and execute tool calls from an AIMessage. Returns list of ToolMessage."""
     if not hasattr(response, "tool_calls") or not response.tool_calls:
         return []
@@ -617,8 +683,22 @@ def _execute_tool_calls(response: AIMessage, tools_by_name: dict) -> list[ToolMe
         if tool_fn:
             try:
                 result = tool_fn.invoke(tc["args"])
-                results.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+                result_str = str(result)
+                success = not result_str.lower().startswith(
+                    ("tool error:", "flight search error:", "hotel search error:", "infeasible:")
+                )
+                _log_event({"type": "tool_call", "agent": _ctx_agent, "tool": tc["name"],
+                            "round": _ctx_round, "success": success})
+                if not success:
+                    hint = _build_retry_hint(tc["name"], result_str, tc.get("args") or {})
+                    if hint:
+                        result_str = result_str + "\n" + hint
+                        _log_event({"type": "retry_hint", "agent": _ctx_agent,
+                                    "tool": tc["name"], "round": _ctx_round})
+                results.append(ToolMessage(content=result_str, tool_call_id=tc["id"]))
             except Exception as e:
+                _log_event({"type": "tool_call", "agent": _ctx_agent, "tool": tc["name"],
+                            "round": _ctx_round, "success": False, "error": str(e)})
                 results.append(ToolMessage(content=f"Tool error: {e}", tool_call_id=tc["id"]))
         else:
             results.append(ToolMessage(
@@ -774,7 +854,8 @@ def adjudicator_loop_node(state: NegotiationState) -> dict:
 
     # Inline tool execution: handle proposal_scorer and declare_outcome calls
     declared_status = None
-    tool_msgs = _execute_tool_calls(response, _ADJUDICATOR_TOOLS_BY_NAME)
+    tool_msgs = _execute_tool_calls(response, _ADJUDICATOR_TOOLS_BY_NAME,
+                                     _ctx_agent="adjudicator", _ctx_round=round_num + 1)
     if tool_msgs:
         for tc in (response.tool_calls or []):
             if tc["name"] == "declare_outcome":
@@ -835,15 +916,32 @@ def make_agent_node(agent_key: str):
         # ReAct loop: reason → act → observe → repeat until no more tool calls
         MAX_REACT_ITERS = 4
         messages = msgs
+        prev_failed_tools: set[str] = set()
         for iteration in range(MAX_REACT_ITERS):
             response = _llms[agent_key].invoke(messages)
-            tool_msgs = _execute_tool_calls(response, _AGENT_TOOLS_BY_NAME)
+            tool_msgs = _execute_tool_calls(response, _AGENT_TOOLS_BY_NAME,
+                                             _ctx_agent=agent_key, _ctx_round=round_num)
             if not tool_msgs:
                 break
-            for tc in (response.tool_calls or []):
+            for tc, tm in zip(response.tool_calls or [], tool_msgs):
                 _print_and_log(
                     f"  [ReAct {iteration + 1}] {actor['display_name']} → {tc['name']}"
                 )
+                result_lower = tm.content.lower()
+                failed_now = result_lower.startswith(
+                    ("tool error:", "no hotels", "no flights found", "infeasible:",
+                     "flight search error:", "hotel search error:")
+                )
+                if not failed_now and tc["name"] in prev_failed_tools:
+                    _log_event({"type": "retry_success", "agent": agent_key,
+                                "tool": tc["name"], "round": round_num})
+                    _print_and_log(
+                        f"  [ReAct ✓] {actor['display_name']} retried {tc['name']} → success"
+                    )
+                if failed_now:
+                    prev_failed_tools.add(tc["name"])
+                else:
+                    prev_failed_tools.discard(tc["name"])
             messages = messages + [response] + tool_msgs
 
         _display_and_log(actor["display_name"], response.content)
@@ -937,7 +1035,7 @@ def agent_collector_node(state: NegotiationState) -> dict:
 # Graph
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_graph(scenario: dict) -> StateGraph:
+def build_graph(scenario: dict, checkpointer=None):
     builder = StateGraph(NegotiationState)
 
     builder.add_node("human_a", human_a_node)
@@ -963,7 +1061,8 @@ def build_graph(scenario: dict) -> StateGraph:
     builder.add_edge("agent_collector", "adjudicator_loop")
     builder.add_edge("resolution", END)
 
-    return builder.compile()
+    interrupt_after = ["adjudicator_loop"] if checkpointer is not None else []
+    return builder.compile(checkpointer=checkpointer, interrupt_after=interrupt_after)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -971,7 +1070,7 @@ def build_graph(scenario: dict) -> StateGraph:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_session(config_path: str) -> dict:
-    global _llms, _log_file
+    global _llms, _log_file, _events_file
 
     config = load_config(config_path)
     scenario = build_scenario(config)
@@ -1000,8 +1099,11 @@ def run_session(config_path: str) -> dict:
         timestamp = started_at.strftime("%Y-%m-%d_%H%M%S")
         log_path = os.path.join(output_dir, f"session_{timestamp}.log")
         _log_file = open(log_path, "w", encoding="utf-8")
+        _events_file = open(log_path.replace(".log", "_events.jsonl"), "w", encoding="utf-8")
         print(f"[LOG] Writing session log to: {log_path}\n")
         _log_session_header(config_path, scenario, started_at)
+        _log_event({"type": "session_start", "scenario": os.path.basename(config_path),
+                    "timestamp": started_at.isoformat(), "max_rounds": max_rounds})
 
     header = (
         "\n" + "╔" + "═" * 70 + "╗\n"
@@ -1041,9 +1143,23 @@ def run_session(config_path: str) -> dict:
             }, f, indent=2)
         print(f"[LOG] Memory snapshot written to: {memory_path}")
 
+    _AGREEMENT_SCORES = {"consensus": 1.0, "partial_consensus": 0.5, "impasse": 0.0}
+    _log_event({
+        "type": "session_end",
+        "status": final_state.get("status", "unknown"),
+        "rounds": final_state.get("round", 0),
+        "max_rounds": max_rounds,
+        "duration_seconds": round((datetime.now() - started_at).total_seconds(), 1),
+        "agreement_score": _AGREEMENT_SCORES.get(final_state.get("status", ""), 0.0),
+        "scenario": os.path.basename(config_path),
+    })
+
     if _log_file:
         _log_file.close()
         _log_file = None
+    if _events_file:
+        _events_file.close()
+        _events_file = None
 
     return final_state
 

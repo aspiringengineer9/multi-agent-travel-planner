@@ -1,0 +1,45 @@
+scenario: >
+  Plan a 3-day ski weekend in Lake Tahoe. Two friends with very different
+  skiing abilities need to agree on accommodation, which mountain/trails to
+  ski, and après-ski evenings.
+
+topics: [accommodation, skiing, evenings]
+
+deliberation_points:
+  - "Accommodation: ski-in/ski-out lodge at the mountain ($200/night, split) vs. Airbnb in South Lake Tahoe town ($90/night, split) with a 20-min drive to the slopes"
+  - "Skiing: stay on blue runs at Heavenly so both can ski together vs. split days where the advanced skier does black runs solo in the morning"
+  - "Evenings: low-key cooking at the Airbnb and early sleep for morning energy vs. dinner and drinks at the mountain village bars"
+
+max_rounds: 3
+
+travel_context:
+  destination: "Lake Tahoe, CA"
+  departure_city: "San Francisco"
+  departure_airport: "SFO"
+  arrival_airport: "RNO"
+  outbound_date: "2027-01-16"
+  return_date: "2027-01-19"
+  check_in: "2027-01-16"
+  check_out: "2027-01-19"
+
+actors:
+  human_a:
+    name: "Beginner Skier"
+    role: human
+    personality: >
+      Started skiing two winters ago. Still building confidence on blue runs.
+      Wants to ski together as much as possible — getting separated on harder
+      terrain feels unsafe and lonely. Prefers the cheaper Airbnb to save money
+      for ski rentals and lessons. Early nights mean better mornings on the slopes.
+    budget: 100  # per day, split costs already factored in
+
+  human_b:
+    name: "Advanced Skier"
+    role: human
+    personality: >
+      Has skied since childhood. Craves black diamonds and moguls. Willing to
+      pay for ski-in/ski-out convenience — wasted time driving to the mountain
+      is wasted skiing. Loves the social après-ski scene; evenings at the
+      mountain bars are half the fun of a ski trip. Fine skiing together on
+      blues for part of the day but needs some solo challenge runs.
+    budget: null  # flexible — this is a rare ski trip, worth splurging

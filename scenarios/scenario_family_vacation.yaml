@@ -1,0 +1,44 @@
+scenario: >
+  Plan a 4-day family vacation to Orlando, Florida. A parent and their
+  teenager need to agree on accommodation, a mix of theme park vs. outdoor
+  activities, and daily dining. The parent controls the budget.
+
+topics: [accommodation, activities, dining]
+
+deliberation_points:
+  - "Accommodation: family-suite hotel near the parks vs. vacation rental with a kitchen to save on food"
+  - "Activities: 2 full days at Disney/Universal vs. splitting time between parks and outdoor (kayaking, nature reserves)"
+  - "Dining: mix of sit-down restaurants vs. mostly quick-service/cooking at rental to stay on budget"
+
+max_rounds: 3
+
+travel_context:
+  destination: "Orlando, FL"
+  departure_city: "Chicago"
+  departure_airport: "ORD"
+  arrival_airport: "MCO"
+  outbound_date: "2026-07-10"
+  return_date: "2026-07-14"
+  check_in: "2026-07-10"
+  check_out: "2026-07-14"
+
+actors:
+  human_a:
+    name: "Budget Parent"
+    role: human
+    personality: >
+      Parent of a 16-year-old. Wants a memorable trip but is very cost-conscious.
+      Prefers a vacation rental with a kitchen to cut food costs, would rather
+      spend one day at a theme park and use the rest for free/cheap outdoor activities.
+      Tired from work — values some relaxation time by a pool.
+    budget: 120  # per day per person (family of 2), strict
+
+  human_b:
+    name: "Thrill-Seeking Teen"
+    role: human
+    personality: >
+      16-year-old who lives for roller coasters and social media moments.
+      Wants to spend as many days as possible at Universal Studios and Disney.
+      Doesn't care about the accommodation as long as there's a pool.
+      Happy to eat quick-service park food all day. Outdoor activities feel boring.
+    budget: null  # flexible (parent pays)

@@ -1,0 +1,46 @@
+scenario: >
+  Plan a 2-day business trip to New York City for a product launch event.
+  Two colleagues attending the same conference need to agree on accommodation,
+  transport within the city, and one client dinner.
+
+topics: [accommodation, transport, client_dinner]
+
+deliberation_points:
+  - "Accommodation: Midtown hotel walking distance to the venue ($280/night) vs. budget hotel in Brooklyn with subway commute ($110/night)"
+  - "Transport: Subway + walking for all trips vs. Uber/taxi for client-facing legs to arrive fresh"
+  - "Client dinner: upscale steakhouse to impress the client ($120/person) vs. well-reviewed mid-range spot ($60/person)"
+
+max_rounds: 2
+
+travel_context:
+  destination: "New York City, NY"
+  departure_city: "Boston"
+  departure_airport: "BOS"
+  arrival_airport: "JFK"
+  outbound_date: "2026-10-14"
+  return_date: "2026-10-16"
+  check_in: "2026-10-14"
+  check_out: "2026-10-16"
+
+actors:
+  human_a:
+    name: "Cost-Conscious Junior"
+    role: human
+    personality: >
+      Junior product manager attending their first big launch event. Excited but
+      very aware that expenses will be reviewed by their manager. Prefers the
+      budget Brooklyn hotel and subway — the commute is fine. For the client
+      dinner, a well-reviewed mid-range restaurant is perfectly professional.
+      Every dollar saved reflects well on them.
+    budget: 150  # per day, strict company expense policy
+
+  human_b:
+    name: "Senior Manager"
+    role: human
+    personality: >
+      Senior director who has done this many times. Believes first impressions
+      with clients require investing in presence — staying near the venue avoids
+      the risk of subway delays. For client dinner, the upscale steakhouse is
+      standard practice and signals that the company values the relationship.
+      Time is more valuable than money on a tight 2-day schedule.
+    budget: null  # flexible — company card, senior discretion

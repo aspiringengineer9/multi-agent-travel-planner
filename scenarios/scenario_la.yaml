@@ -17,10 +17,10 @@ travel_context:
   departure_city: "San Francisco"
   departure_airport: "SFO"
   arrival_airport: "LAX"
-  outbound_date: "2025-09-20"
-  return_date: "2025-09-20"
-  check_in: "2025-09-20"
-  check_out: "2025-09-20"
+  outbound_date: "2026-06-20"
+  return_date: "2026-06-20"
+  check_in: "2026-06-20"
+  check_out: "2026-06-20"
 
 actors:
   human_a:
